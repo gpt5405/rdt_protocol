@@ -1,0 +1,3 @@
+Hello! This is a test file for Reliable Data Transfer.
+The file will be transferred over UDP with loss and corruption.
+The protocol should recover using retransmission and acknowledgments.
