@@ -18,11 +18,14 @@ import os
 import signal
 import socket
 import time
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
 
 from rdt import RDTSession
 
 BUF = 65535   # max UDP datagram buffer size
+
+# Idle timeout while receiving a PUT payload (seconds).
+PUT_IDLE_TIMEOUT = 6.0
 
 
 def win_udp_no_connreset(sock: socket.socket) -> None:
@@ -40,15 +43,58 @@ def win_udp_no_connreset(sock: socket.socket) -> None:
         pass
 
 
+class PeerState:
+    """
+    Per-peer application state.
+
+    - inbuf: accumulates command-line bytes until '\n' is seen
+    - mode: None or 'receiving' during PUT
+    - filename: target filename during PUT
+    - filebuf: bytearray of file content during PUT
+    - last_data_ts: last time we received any file bytes (for idle cutoff)
+    """
+
+    def __init__(self) -> None:
+        self.inbuf = bytearray()
+        self.mode: Optional[str] = None
+        self.filename: Optional[str] = None
+        self.filebuf = bytearray()
+        self.last_data_ts: float = 0.0
+
+    def start_put(self, filename: str) -> None:
+        self.mode = "receiving"
+        self.filename = filename
+        self.filebuf = bytearray()
+        self.last_data_ts = time.monotonic()
+
+    def on_file_bytes(self, data: bytes) -> None:
+        if not data:
+            return
+        self.filebuf.extend(data)
+        self.last_data_ts = time.monotonic()
+
+    def put_done(self) -> Tuple[str, int, bytes]:
+        """Finalize PUT state; return (filename, num_bytes, content)."""
+        name = self.filename or "upload.bin"
+        content = bytes(self.filebuf)
+        n = len(content)
+        # Reset state for next command
+        self.mode = None
+        self.filename = None
+        self.filebuf.clear()
+        return name, n, content
+
+
 def main():
     """
     Main server loop.
 
     Responsibilities:
       - Bind a UDP socket and listen for incoming datagrams.
-      - Maintain a dictionary of per-peer RDTSession objects.
+      - Maintain a dictionary of per-peer RDTSession objects + app state.
       - Feed raw packets into the proper session via handle_raw().
-      - Process fully reassembled application bytes (GET/PUT/etc.).
+      - Parse newline-terminated commands from a per-peer buffer.
+      - While in PUT mode, treat all bytes as file data until idle timeout.
       - Shut down cleanly on Ctrl+C.
     """
     ap = argparse.ArgumentParser(description="RDT File Server")
@@ -68,6 +114,8 @@ def main():
 
     # Per-peer RDT session table: {(ip,port) -> RDTSession}
     sessions: Dict[Tuple[str, int], RDTSession] = {}
+    # Per-peer app-layer state (command buffer, PUT mode, etc.)
+    app_state: Dict[Tuple[str, int], PeerState] = {}
 
     stopping = False   # set to True on Ctrl+C
 
@@ -100,64 +148,82 @@ def main():
                 break
 
             if raw is not None:
-                # Create a new RDT session lazily on first packet from client
+                # Create a new RDT session and app state lazily on first packet from client
                 if addr not in sessions:
                     sessions[addr] = RDTSession(sock, addr,
                                                 window=args.window,
                                                 timeout=args.timeout)
+                    app_state[addr] = PeerState()
                     print(f"[SERVER] new peer {addr}")
 
                 # Pass raw UDP bytes to RDT (could be data or ACK)
                 sessions[addr].handle_raw(raw)
 
-            # 2) Check each peer for fully reassembled app data
+            # 2) Process per-peer application state
+            now = time.monotonic()
             for addr, sess in list(sessions.items()):
-                app = sess.recv_available()
-                if not app:
-                    continue  # nothing to process yet
+                st = app_state[addr]
 
-                text = app.decode(errors="ignore")
+                # If currently receiving a file (PUT mode), treat all bytes as file data
+                if st.mode == "receiving":
+                    more = sess.recv_available()
+                    if more:
+                        st.on_file_bytes(more)
 
-                # GET COMMAND
-                if text.startswith("GET "):
-                    line = text.splitlines()[0]
-                    _, name = line.split(" ", 1)
-                    name = name.strip()
-                    if not os.path.isfile(name):
-                        sess.send(f"ERROR: File {name} not found".encode())
+                    # Finalize if we've been idle long enough
+                    if (now - st.last_data_ts) >= PUT_IDLE_TIMEOUT:
+                        filename, nbytes, content = st.put_done()
+                        with open(filename, "wb") as f:
+                            f.write(content)
+                        print(f"[SERVER] stored {filename} ({nbytes}B) from {addr}")
+                        sess.send(f"OK: Stored {filename} ({nbytes} bytes)".encode())
+                        # Done with this peer for this iteration
                         continue
-                    with open(name, "rb") as f:
-                        data = f.read()
-                    print(f"[SERVER] sending {name} ({len(data)}B) to {addr}")
-                    sess.send(data)
 
-                # PUT COMMAND
-                elif text.startswith("PUT "):
-                    line = text.splitlines()[0]
-                    _, name = line.split(" ", 1)
-                    name = name.strip()
-                    print(f"[SERVER] expecting upload -> {name} from {addr}")
+                # Not in PUT mode: read any app bytes and parse commands
+                if st.mode != "receiving":
+                    app = sess.recv_available()
+                    if not app:
+                        continue
 
-                    # Collect file bytes with extended idle timeout
-                    chunks = []
-                    last = time.monotonic()
-                    while time.monotonic() - last < 6.0:  # tolerate slow transfer
-                        b = sess.recv_available()
-                        if b:
-                            chunks.append(b)
-                            last = time.monotonic()
+                    # Accumulate into command buffer
+                    st.inbuf.extend(app)
+
+                    # Process complete lines (commands end with '\n')
+                    while True:
+                        nl = st.inbuf.find(b"\n")
+                        if nl < 0:
+                            break  # wait for more bytes to complete a line
+                        # Extract one full line (without trailing '\n')
+                        line = bytes(st.inbuf[:nl]).decode(errors="ignore").strip()
+                        # Drop processed bytes (line + '\n')
+                        del st.inbuf[:nl + 1]
+
+                        # Command parsing
+                        if line.upper().startswith("GET "):
+                            _, name = line.split(" ", 1)
+                            name = name.strip()
+                            if not os.path.isfile(name):
+                                sess.send(f"ERROR: File {name} not found".encode())
+                            else:
+                                with open(name, "rb") as f:
+                                    data = f.read()
+                                print(f"[SERVER] sending {name} ({len(data)}B) to {addr}")
+                                sess.send(data)
+
+                        elif line.upper().startswith("PUT "):
+                            _, name = line.split(" ", 1)
+                            name = name.strip()
+                            print(f"[SERVER] expecting upload -> {name} from {addr}")
+                            st.start_put(name)
+                            # Immediately drain any payload that might already be queued
+                            more = sess.recv_available()
+                            if more:
+                                st.on_file_bytes(more)
+
                         else:
-                            time.sleep(0.05)
-
-                    content = b"".join(chunks)
-                    with open(name, "wb") as f:
-                        f.write(content)
-                    print(f"[SERVER] stored {name} ({len(content)}B) from {addr}")
-                    sess.send(f"OK: Stored {name} ({len(content)} bytes)".encode())
-
-                # ANY OTHER TEXT -> ECHO
-                else:
-                    sess.send(b"OK: ECHO: " + app)
+                            # Unknown command -> echo only this line back
+                            sess.send(("OK: ECHO: " + line).encode())
 
     finally:
         # Graceful shutdown
