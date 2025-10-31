@@ -11,7 +11,7 @@ This repo contains a working, minimal, **Selective Repeat** RDT over UDP, a netw
 - `requirements.txt` - Package requirements list
 - `revisions.txt` - Git logs
 - `rdt_report.pdf` - Screenshots showing functional operation
-- `sphinx_report.pdf` - Auto-generated code docs PDF
+- `rdt_sphinx_report.pdf` - Auto-generated code docs PDF
 
 **Python**: 3.9+ recommended. No external dependencies.
 
